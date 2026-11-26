@@ -660,6 +660,15 @@ def needs_placeholder_lookup(media_item: MediaItem, now: datetime | None = None)
     return is_watch_state_placeholder(media_item) and not missed_recently(media_item, now or datetime.now(timezone.utc))
 
 
+def needs_metadata_lookup(media_item: MediaItem, now: datetime | None = None) -> bool:
+    """A placeholder or a title without a poster, with no confirmed miss in the last LOOKUP_MISS_COOLDOWN."""
+    return lookup_unresolved(media_item) and not missed_recently(media_item, now or datetime.now(timezone.utc))
+
+
+def lookup_unresolved(media_item: MediaItem) -> bool:
+    return is_watch_state_placeholder(media_item) or not media_item.poster_url
+
+
 def missed_recently(media_item: MediaItem, now: datetime) -> bool:
     raw = media_item.raw if isinstance(media_item.raw, dict) else {}
     try:
@@ -676,9 +685,9 @@ def no_recent_lookup_miss_clause(now: datetime):
     return or_(missed_at.is_(None), missed_at < (now - LOOKUP_MISS_COOLDOWN).isoformat())
 
 
-def settle_placeholder_lookup(media_item: MediaItem, outcome: LookupOutcome, now: datetime) -> str:
-    """Record what a placeholder lookup achieved. Only a resolved title counts as refreshed."""
-    if not is_watch_state_placeholder(media_item):
+def settle_metadata_lookup(media_item: MediaItem, outcome: LookupOutcome, now: datetime) -> str:
+    """Record what a lookup achieved. Only a resolved title with a poster counts as refreshed."""
+    if not lookup_unresolved(media_item):
         media_item.metadata_refreshed_at = now
         return "refreshed"
     if outcome.retry_at is not None:
@@ -690,9 +699,10 @@ def settle_placeholder_lookup(media_item: MediaItem, outcome: LookupOutcome, now
     if not outcome.requests:
         # Nothing was asked, so nothing is known about the title.
         return "not_attempted"
-    # Providers answered without a match: wait LOOKUP_MISS_COOLDOWN before asking again.
+    # Providers answered without a title or poster: wait LOOKUP_MISS_COOLDOWN before asking again.
     if not missed_recently(media_item, now):
-        media_item.raw = {**media_item.raw, LOOKUP_MISS_KEY: now.isoformat()}
+        raw = media_item.raw if isinstance(media_item.raw, dict) else {}
+        media_item.raw = {**raw, LOOKUP_MISS_KEY: now.isoformat()}
     return "missed"
 
 

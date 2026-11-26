@@ -9,10 +9,10 @@ from librarysync.connectors.metadata.base import MetadataProvider
 from librarysync.core.metadata_enrichment import (
     LookupOutcome,
     enrich_watched_metadata,
-    is_watch_state_placeholder,
+    lookup_unresolved,
     missed_recently,
     no_recent_lookup_miss_clause,
-    settle_placeholder_lookup,
+    settle_metadata_lookup,
     watch_state_placeholder_clause,
 )
 from librarysync.core.metadata_providers import load_random_provider
@@ -32,6 +32,7 @@ from librarysync.db.models import (
     OutboxJob,
     ScheduledJob,
     WatchedItem,
+    WatchlistItem,
 )
 from librarysync.db.session import SessionLocal, init_session_factory
 from librarysync.jobs.simkl_calendar import process_simkl_calendar_once
@@ -148,7 +149,17 @@ async def _backfill_media_items(
         watch_state_placeholder_clause(),
         no_recent_lookup_miss_clause(now),
     )
-    union_ids = union_all(direct_ids, episode_ids, placeholder_ids).subquery()
+    # Trakt and SIMKL watchlist imports carry no artwork, and an unwatched title has no watch either.
+    posterless_watchlist_ids = (
+        select(WatchlistItem.media_item_id.label("media_item_id"))
+        .join(MediaItem, MediaItem.id == WatchlistItem.media_item_id)
+        .where(
+            MediaItem.poster_url.is_(None),
+            no_recent_lookup_miss_clause(now),
+            WatchlistItem.status != "removed",
+        )
+    )
+    union_ids = union_all(direct_ids, episode_ids, placeholder_ids, posterless_watchlist_ids).subquery()
 
     missing_predicate = _missing_metadata_predicate(tmdb_required)
     episode_predicate = _episode_refresh_predicate(tmdb_required, episode_refresh_cutoff)
@@ -189,10 +200,11 @@ async def _backfill_media_items(
             if media_item is None:
                 # Gone, or another worker holds it. A later run takes it up.
                 continue
-            placeholder = is_watch_state_placeholder(media_item)
+            # Placeholders and titles without a poster follow the lookup rules: refreshed only when resolved.
+            unresolved = lookup_unresolved(media_item)
             if (
                 provider_overrides
-                and not (placeholder and missed_recently(media_item, now))
+                and not (unresolved and missed_recently(media_item, now))
                 and _should_refresh_media_metadata(media_item, tmdb_required)
                 and not await _lookup_queued(db, media_item.id)
             ):
@@ -212,8 +224,8 @@ async def _backfill_media_items(
                         use_overrides_only=use_overrides_only,
                         outcome=outcome,
                     )
-                    if placeholder:
-                        settle_placeholder_lookup(media_item, outcome, now)
+                    if unresolved:
+                        settle_metadata_lookup(media_item, outcome, now)
                     elif outcome.retry_at is None:
                         media_item.metadata_refreshed_at = now
                     if outcome.retry_at is not None:
