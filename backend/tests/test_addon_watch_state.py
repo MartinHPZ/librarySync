@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from importlib import import_module
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from librarysync.core import (
 )
 from librarysync.core.http_client import retry_after_seconds
 from librarysync.core.metadata_enrichment import enrich_watched_metadata
+from librarysync.core.watchlist_sources import ensure_watchlist_source
 from librarysync.db.models import (
     Base,
     EpisodeItem,
@@ -38,12 +40,22 @@ from librarysync.db.models import (
     WatchEvent,
     WatchlistItem,
 )
-from librarysync.jobs import metadata_backfill, process_outbox
+from librarysync.jobs import metadata_backfill, process_outbox, simkl_import, trakt_import, watchlist_pipeline
 from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 AT = 1790947444
 BASE = "/stremio-addon/addon-one"
+POSTER = "https://image.tmdb.org/t/p/w500/poster.jpg"
+TRAKT_ENTRY = {
+    "type": "movie",
+    "id": 7001,
+    "listed_at": "2026-11-26T12:00:00.000Z",
+    "movie": {"title": "Monsters, Inc.", "year": 2001, "ids": {"trakt": 1, "imdb": "tt0198781", "tmdb": 585}},
+}
+SIMKL_ENTRY = {
+    "movie": {"title": "Monsters, Inc.", "year": 2001, "ids": {"simkl": 1, "imdb": "tt0198781", "tmdb": 585}}
+}
 
 
 def movie_event(event="stop", **overrides):
@@ -129,8 +141,9 @@ def placeholder(imdb_id, tmdb_id):
 
 @pytest_asyncio.fixture
 async def context(monkeypatch):
-    # The lookup gate asks for a configured metadata provider. Tests of the gate itself restore it.
+    # The lookup gates ask for a configured metadata provider. Tests of the gates themselves restore them.
     monkeypatch.setattr(watch_state_events, "has_metadata_provider", AsyncMock(return_value=True))
+    monkeypatch.setattr(watchlist_pipeline, "has_metadata_provider", AsyncMock(return_value=True))
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -535,13 +548,13 @@ async def test_backfill_enriches_watchlist_only_titles(context, monkeypatch):
         media_type="movie",
         title="The Shawshank Redemption",
         year=1994,
-        poster_url=None,
+        poster_url=POSTER,
         imdb_id="tt0111161",
     )
     await finish_lookup_jobs(db)
     await run_backfill(db, monkeypatch, provider)
     await db.refresh(media)
-    assert media.title == "The Shawshank Redemption"
+    assert (media.title, media.poster_url) == ("The Shawshank Redemption", POSTER)
     assert media.metadata_refreshed_at is not None
 
 
@@ -633,7 +646,7 @@ async def test_anime_lookup_that_cannot_ask_any_provider_makes_no_request(contex
     anilist.search.assert_not_awaited()
     assert outcome.requests == 0
     now = datetime.now(timezone.utc)
-    assert metadata_enrichment.settle_placeholder_lookup(media, outcome, now) == "not_attempted"
+    assert metadata_enrichment.settle_metadata_lookup(media, outcome, now) == "not_attempted"
     assert metadata_enrichment.LOOKUP_MISS_KEY not in media.raw
 
 
@@ -926,11 +939,11 @@ async def test_title_the_provider_does_not_know_is_a_confirmed_miss(context):
         db, "user-one", media, None, provider_overrides={"tmdb": provider}, use_overrides_only=True, outcome=outcome
     )
     now = datetime.now(timezone.utc)
-    assert metadata_enrichment.settle_placeholder_lookup(media, outcome, now) == "missed"
+    assert metadata_enrichment.settle_metadata_lookup(media, outcome, now) == "missed"
     assert media.raw[metadata_enrichment.LOOKUP_MISS_KEY] == now.isoformat()
     # A miss already in its cooldown is not rewritten, so the shared catalog is not rebuilt for nothing.
     later = now + timedelta(hours=1)
-    assert metadata_enrichment.settle_placeholder_lookup(media, outcome, later) == "missed"
+    assert metadata_enrichment.settle_metadata_lookup(media, outcome, later) == "missed"
     assert media.raw[metadata_enrichment.LOOKUP_MISS_KEY] == now.isoformat()
 
 
@@ -1126,7 +1139,7 @@ async def test_known_kitsu_id_names_the_placeholder_but_never_a_real_title(conte
 @pytest.mark.asyncio
 async def test_backfill_leaves_other_watchlist_titles_alone(context, monkeypatch):
     _, db, _ = context
-    media = MediaItem(media_type="movie", title="The Shawshank Redemption", imdb_id="tt0111161")
+    media = MediaItem(media_type="movie", title="The Shawshank Redemption", imdb_id="tt0111161", poster_url=POSTER)
     db.add(media)
     await db.flush()
     db.add(WatchlistItem(user_id="user-one", media_item_id=media.id, type="movie", source="trakt"))
@@ -1154,7 +1167,8 @@ async def test_metadata_update_job_skips_titles_already_enriched(context, monkey
     client, db, _ = context
     await client.post(f"{BASE}/watch_state/push/movie/tt0111161.json", json=movie_event("watchlisted"))
     media = await db.scalar(select(MediaItem))
-    media.title = "The Shawshank Redemption"  # new_item_added got there first.
+    # new_item_added got there first.
+    media.title, media.poster_url = "The Shawshank Redemption", POSTER
     job = await db.scalar(select(OutboxJob).where(OutboxJob.job_type == "metadata_update"))
     enrich = AsyncMock()
     monkeypatch.setattr(watch_pipeline, "enrich_watched_metadata", enrich)
@@ -1283,3 +1297,175 @@ def test_admin_merge_does_not_carry_a_lookup_miss_over():
     empty = MediaItem(media_type="movie", title="The Shawshank Redemption", raw=None)
     routes_admin._merge_media_item_fields(empty, source)
     assert empty.raw == {"stremio_id": "tt0111161"}
+
+
+def watchlist_candidate(importer, entry, provider, poster_url=None):
+    return replace(importer._build_watchlist_candidate(entry, source=provider), poster_url=poster_url)
+
+
+async def import_watchlist(db, provider, candidates):
+    source = await ensure_watchlist_source(
+        db, "user-one", provider, "personal", "watchlist", name=f"{provider} watchlist"
+    )
+    await watchlist_pipeline.process_watchlist_candidates(db, "user-one", provider, source, candidates)
+    return (await db.scalars(select(OutboxJob).where(OutboxJob.job_type == "metadata_update"))).all()
+
+
+IMPORTS = pytest.mark.parametrize(
+    ("importer", "entry", "provider"),
+    [(trakt_import, TRAKT_ENTRY, "trakt"), (simkl_import, SIMKL_ENTRY, "simkl")],
+)
+
+
+@pytest.mark.asyncio
+@IMPORTS
+async def test_watchlist_import_queues_one_lookup_for_titles_without_poster(context, importer, entry, provider):
+    _, db, _ = context
+    candidate = watchlist_candidate(importer, entry, provider)
+    jobs = await import_watchlist(db, provider, [candidate])
+    media = await db.scalar(select(MediaItem))
+    assert (media.title, media.poster_url) == ("Monsters, Inc.", None)
+    assert [job.payload for job in jobs] == [{"media_item_id": media.id}]
+    assert len(await import_watchlist(db, provider, [candidate])) == 1
+
+
+@pytest.mark.asyncio
+@IMPORTS
+async def test_watchlist_import_skips_titles_with_poster(context, importer, entry, provider):
+    _, db, _ = context
+    assert await import_watchlist(db, provider, [watchlist_candidate(importer, entry, provider, POSTER)]) == []
+
+
+@pytest.mark.asyncio
+async def test_one_import_listing_a_title_twice_queues_one_lookup(context):
+    _, db, _ = context
+    candidate = watchlist_candidate(trakt_import, TRAKT_ENTRY, "trakt")
+    with db.no_autoflush:
+        # Production sessions do not autoflush, so the second entry must find the first one's unflushed job.
+        jobs = await import_watchlist(db, "trakt", [candidate, replace(candidate, entry_key="trakt:watchlist:7002")])
+    assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_watchlist_import_queues_nothing_without_a_metadata_provider(context, monkeypatch):
+    _, db, _ = context
+    monkeypatch.setattr(watchlist_pipeline, "has_metadata_provider", metadata_providers.has_metadata_provider)
+    assert await import_watchlist(db, "trakt", [watchlist_candidate(trakt_import, TRAKT_ENTRY, "trakt")]) == []
+
+
+@pytest.mark.asyncio
+async def test_metadata_update_job_fills_a_missing_poster(context, monkeypatch):
+    _, db, _ = context
+    jobs = await import_watchlist(db, "trakt", [watchlist_candidate(trakt_import, TRAKT_ENTRY, "trakt")])
+
+    async def enrich(db, user_id, media_item, episode_item, outcome=None, **_kwargs):
+        outcome.requests = 1
+        media_item.poster_url = POSTER
+
+    monkeypatch.setattr(watch_pipeline, "enrich_watched_metadata", enrich)
+    await watch_pipeline.process_metadata_update_job(db, jobs[0])
+    media = await db.scalar(select(MediaItem))
+    assert media.poster_url == POSTER
+    assert media.metadata_refreshed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_poster_miss_is_not_looked_up_again_on_the_next_import(context, monkeypatch):
+    _, db, _ = context
+    candidate = watchlist_candidate(trakt_import, TRAKT_ENTRY, "trakt")
+    jobs = await import_watchlist(db, "trakt", [candidate])
+    monkeypatch.setattr(watch_pipeline, "enrich_watched_metadata", fake_enrich(requests=1))
+    await watch_pipeline.process_metadata_update_job(db, jobs[0])
+    await finish_lookup_jobs(db)
+    media = await db.scalar(select(MediaItem))
+    assert media.metadata_refreshed_at is None
+    assert metadata_enrichment.LOOKUP_MISS_KEY in media.raw
+    assert [job.status for job in await import_watchlist(db, "trakt", [candidate])] == ["succeeded"]
+
+
+async def add_posterless_watchlist_titles(db, count):
+    for number in range(1, count + 1):
+        media = MediaItem(media_type="movie", title=f"Movie {number}", imdb_id=f"tt000000{number}", tmdb_id=str(number))
+        db.add(media)
+        await db.flush()
+        db.add(WatchlistItem(user_id="user-one", media_item_id=media.id, type="movie", source="trakt"))
+    await db.commit()
+
+
+def movie_details(poster=True):
+    def details(provider_id, scope):
+        return MediaCandidate(
+            provider="tmdb",
+            provider_id=provider_id,
+            media_type="movie",
+            title=f"Movie {provider_id}",
+            year=2000,
+            poster_url=f"https://image.tmdb.org/t/p/w500/{provider_id}.jpg" if poster else None,
+            imdb_id=None,
+        )
+
+    return details
+
+
+@pytest.mark.asyncio
+async def test_backfill_fills_posters_across_batches(context, monkeypatch):
+    _, db, _ = context
+    await add_posterless_watchlist_titles(db, 3)
+    provider = tmdb_provider()
+    provider.get_details.side_effect = movie_details()
+    await run_backfill(db, monkeypatch, provider, batch_size=1)
+    assert all((await db.scalars(select(MediaItem.poster_url))).all())
+
+
+@pytest.mark.asyncio
+async def test_backfill_poster_miss_waits_out_the_cooldown(context, monkeypatch):
+    _, db, _ = context
+    await add_posterless_watchlist_titles(db, 1)
+    provider = tmdb_provider()
+    provider.get_details.side_effect = movie_details(poster=False)
+    await run_backfill(db, monkeypatch, provider)
+    media = await db.scalar(select(MediaItem))
+    assert media.metadata_refreshed_at is None
+    assert metadata_enrichment.LOOKUP_MISS_KEY in media.raw
+    await run_backfill(db, monkeypatch, provider)
+    provider.get_details.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_backfill_stops_for_posterless_titles_at_the_rate_limit(context, monkeypatch):
+    _, db, _ = context
+    await add_posterless_watchlist_titles(db, 2)
+    # An empty bucket: the real limiter refuses the first request.
+    bucket = tmdb_bucket(0.0)
+    db.add(bucket)
+    await db.commit()
+    provider = tmdb_provider()
+    await run_backfill(db, monkeypatch, provider)
+    provider.get_details.assert_not_awaited()
+    for media in (await db.scalars(select(MediaItem))).all():
+        assert media.metadata_refreshed_at is None
+        assert metadata_enrichment.LOOKUP_MISS_KEY not in (media.raw or {})
+
+
+@pytest.mark.asyncio
+async def test_wrong_tvdb_match_does_not_displace_the_tmdb_poster(context, monkeypatch):
+    _, db, _ = context
+    media = MediaItem(media_type="movie", title="Monsters, Inc.", imdb_id="tt0198781", tmdb_id="585")
+    db.add(media)
+    await db.flush()
+    tmdb_mock = tmdb_provider()
+    tmdb_mock.get_details.return_value = MediaCandidate(
+        provider="tmdb",
+        provider_id="585",
+        media_type="movie",
+        title="Monsters, Inc.",
+        year=2001,
+        poster_url=POSTER,
+        imdb_id="tt0198781",
+    )
+    # TVDB's free-text search for the IMDb id finds another film, which comes first in the poster order.
+    other = {"id": "movie-999", "type": "movie", "name": "Another Film", "image": "https://artworks.thetvdb.com/x.jpg"}
+    scripted_http(monkeypatch, tvdb, [LOGIN, (200, {"data": [other]})])
+    overrides = {"tmdb": tmdb_mock, "tvdb": real_tvdb(language=None)}
+    await enrich_watched_metadata(db, "user-one", media, None, provider_overrides=overrides, use_overrides_only=True)
+    assert (media.poster_url, media.tvdb_id) == (POSTER, None)
